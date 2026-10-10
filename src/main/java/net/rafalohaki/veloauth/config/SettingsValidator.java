@@ -31,6 +31,7 @@ public final class SettingsValidator {
         validateFloodgate(settings);
         validateAuditLog(settings);
         validateTwoFactor(settings);
+        validateDialog(settings);
         settings.normalizeLanguage();
         logger.debug("Configuration validation completed successfully");
     }
@@ -39,6 +40,19 @@ public final class SettingsValidator {
         int retention = settings.getAuditLogSettings().getRetentionDays();
         if (retention < 1 || retention > 3650) {
             throw new IllegalArgumentException("Audit log retention-days must be in range 1-3650");
+        }
+    }
+
+    static void validateDialog(Settings settings) {
+        Settings.DialogSettings dialog = settings.getDialogSettings();
+        if (dialog.getTimeoutSeconds() < 10 || dialog.getTimeoutSeconds() > 600) {
+            throw new IllegalArgumentException("dialog.timeout-seconds must be in range 10-600");
+        }
+        if (dialog.getLocaleWaitMillis() < 0 || dialog.getLocaleWaitMillis() > 10_000) {
+            throw new IllegalArgumentException("dialog.locale-wait-millis must be in range 0-10000");
+        }
+        if (dialog.getPremiumCheckSeconds() < 1 || dialog.getPremiumCheckSeconds() > 30) {
+            throw new IllegalArgumentException("dialog.premium-name-notice.check-seconds must be in range 1-30");
         }
     }
 

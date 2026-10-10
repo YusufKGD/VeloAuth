@@ -55,6 +55,7 @@ final class SettingsLoader {
         loadAlertSettings(config, state);
         loadAuditLogSettings(config, state);
         loadTwoFactorSettings(config, state);
+        loadDialogSettings(config, state);
         loadDebugSettings(config, state);
         loadReportSettings(config, state);
         loadLanguageSettings(config, state);
@@ -111,6 +112,43 @@ final class SettingsLoader {
         state.auditLogSettings = new Settings.AuditLogSettings(
                 YamlParserUtils.getBoolean(auditLog, YAML_FIELD_ENABLED, target.isEnabled()),
                 YamlParserUtils.getInt(auditLog, "retention-days", target.getRetentionDays()));
+    }
+
+    private static void loadDialogSettings(Map<String, Object> config, Builder state) {
+        Map<String, Object> dialog = mapSectionOrEmpty(config, "dialog", "dialog");
+        if (dialog.isEmpty()) {
+            return;
+        }
+        Settings.DialogSettings target = state.dialogSettings;
+        Map<String, Object> notice = mapSectionOrEmpty(dialog, "premium-name-notice", "dialog.premium-name-notice");
+        state.dialogSettings = new Settings.DialogSettings(
+                resolveDialogEnabled(dialog, target.isEnabled()),
+                YamlParserUtils.getInt(dialog, "timeout-seconds", target.getTimeoutSeconds()),
+                YamlParserUtils.getInt(dialog, "locale-wait-millis", target.getLocaleWaitMillis()),
+                YamlParserUtils.getBoolean(dialog, "allow-cancel", target.isAllowCancel()),
+                YamlParserUtils.getBoolean(dialog, "error-icon", target.isErrorIcon()),
+                YamlParserUtils.getBoolean(notice, YAML_FIELD_ENABLED, target.isPremiumNameNotice()),
+                YamlParserUtils.getInt(notice, "check-seconds", target.getPremiumCheckSeconds()),
+                YamlParserUtils.getString(notice, "server-name", target.getServerName()));
+    }
+
+    /**
+     * {@code dialog.format} selects the login UI: {@code dialog} (GUI, default) or
+     * {@code chat_system} (classic /register and /login commands). The legacy boolean
+     * {@code dialog.enabled} is still honoured when {@code format} is absent.
+     */
+    private static boolean resolveDialogEnabled(Map<String, Object> dialog, boolean fallback) {
+        Object raw = dialog.get("format");
+        if (raw != null) {
+            String format = String.valueOf(raw).trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
+            return switch (format) {
+                case "chat_system", "chat", "command", "commands", "classic" -> false;
+                case "dialog", "gui", "menu" -> true;
+                default -> throw new IllegalArgumentException(
+                        "dialog.format must be 'dialog' or 'chat_system' (got '" + raw + "')");
+            };
+        }
+        return YamlParserUtils.getBoolean(dialog, YAML_FIELD_ENABLED, fallback);
     }
 
     private static void loadTwoFactorSettings(Map<String, Object> config, Builder state) {
@@ -579,6 +617,7 @@ final class SettingsLoader {
         Settings.PasswordPolicy passwordPolicy;
         Settings.AuditLogSettings auditLogSettings;
         Settings.TwoFactorSettings twoFactorSettings;
+        Settings.DialogSettings dialogSettings;
         Settings.EmbeddedAuthServerSettings embeddedAuthServerSettings;
 
         Builder(Settings.Snapshot snapshot) {
@@ -631,6 +670,7 @@ final class SettingsLoader {
             alertSettings = snapshot.alerts();
             auditLogSettings = snapshot.auditLog();
             twoFactorSettings = snapshot.twoFactor();
+            dialogSettings = snapshot.dialog();
 
             Settings.HotSettings hot = snapshot.hot();
             debugEnabled = hot.debugEnabled();
@@ -685,6 +725,7 @@ final class SettingsLoader {
                     alertSettings,
                     auditLogSettings,
                     twoFactorSettings,
+                    dialogSettings,
                     new Settings.HotSettings(
                             debugEnabled,
                             reportEnabled,
