@@ -3,9 +3,6 @@ package net.rafalohaki.veloauth.dialog;
 import com.velocitypowered.api.proxy.Player;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
-import io.netty.buffer.ByteBufInputStream;
-import io.netty.buffer.ByteBufOutputStream;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
@@ -13,20 +10,14 @@ import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
 import io.netty.util.ReferenceCountUtil;
-import net.kyori.adventure.nbt.BinaryTag;
-import net.kyori.adventure.nbt.BinaryTagIO;
 import net.kyori.adventure.nbt.CompoundBinaryTag;
 import org.slf4j.Logger;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
-import java.nio.charset.StandardCharsets;
-import java.util.Locale;
 import java.util.function.Consumer;
 
 /**
@@ -74,9 +65,7 @@ public final class VelocityDialogTransport {
     private static final String CLS_DIALOG_SHOW = "com.velocitypowered.proxy.protocol.packet.DialogShowPacket";
     private static final String CLS_DIALOG_CLEAR = "com.velocitypowered.proxy.protocol.packet.DialogClearPacket";
     private static final String CLS_CUSTOM_CLICK = "com.velocitypowered.proxy.protocol.packet.ServerboundCustomClickActionPacket";
-    private static final int MAX_CLICK_PAYLOAD = 65_536;
     /** NBT tag id of TAG_Compound; kept as a literal to avoid BinaryTagType method calls (see writeNbt). */
-    private static final byte NBT_TYPE_COMPOUND = 10;
 
     private final Logger logger;
     private final boolean available;
@@ -221,12 +210,11 @@ public final class VelocityDialogTransport {
             } catch (NoSuchMethodException older) {
                 return false;
             }
-            Object connection = getConnection.invoke(player);
-            if (connection == null || (boolean) connectionIsClosed.invoke(connection)) {
+            Object connection = openConnection(player);
+            if (connection == null) {
                 return false;
             }
-            Channel channel = (Channel) connectionGetChannel.invoke(connection);
-            ChannelPipeline pipeline = channel.pipeline();
+            ChannelPipeline pipeline = pipelineOf(connection);
             if (pipeline.get(JOIN_GAME_HANDLER_NAME) != null) {
                 return true;
             }
@@ -266,12 +254,11 @@ public final class VelocityDialogTransport {
             ClassLoader loader = connectedPlayerClass.getClassLoader();
             Class<?> systemChatClass = Class.forName(CLS_SYSTEM_CHAT, false, loader);
             java.lang.reflect.Method getType = systemChatClass.getMethod("getType");
-            Object connection = getConnection.invoke(player);
-            if (connection == null || (boolean) connectionIsClosed.invoke(connection)) {
+            Object connection = openConnection(player);
+            if (connection == null) {
                 return false;
             }
-            Channel channel = (Channel) connectionGetChannel.invoke(connection);
-            ChannelPipeline pipeline = channel.pipeline();
+            ChannelPipeline pipeline = pipelineOf(connection);
             if (pipeline.get(CHAT_MUTE_HANDLER_NAME) != null) {
                 return true;
             }
@@ -309,15 +296,7 @@ public final class VelocityDialogTransport {
     /** Removes the chat filter installed by {@link #muteChat}. */
     public void unmuteChat(Player player) {
         try {
-            Object connection = getConnection.invoke(player);
-            if (connection == null) {
-                return;
-            }
-            Channel channel = (Channel) connectionGetChannel.invoke(connection);
-            ChannelPipeline pipeline = channel.pipeline();
-            if (pipeline.get(CHAT_MUTE_HANDLER_NAME) != null) {
-                pipeline.remove(CHAT_MUTE_HANDLER_NAME);
-            }
+            removeHandler(player, CHAT_MUTE_HANDLER_NAME);
         } catch (Throwable t) {
             logger.debug("Cannot unmute chat for {}: {}", player.getUsername(), t.toString());
         }
@@ -341,8 +320,8 @@ public final class VelocityDialogTransport {
             return false;
         }
         try {
-            Object connection = getConnection.invoke(player);
-            if (connection == null || (boolean) connectionIsClosed.invoke(connection)) {
+            Object connection = openConnection(player);
+            if (connection == null) {
                 return false;
             }
             return dialogState(connectionGetState.invoke(connection)) != null;
@@ -374,60 +353,44 @@ public final class VelocityDialogTransport {
 
     /** Sends (or replaces) the dialog currently displayed by the client. */
     public boolean show(Player player, CompoundBinaryTag dialog) {
-        try {
-            Object connection = getConnection.invoke(player);
-            if (connection == null || (boolean) connectionIsClosed.invoke(connection)) {
-                return false;
-            }
-            Object state = dialogState(connectionGetState.invoke(connection));
-            if (state == null) {
-                return false;
-            }
-            int protocol = player.getProtocolVersion().getProtocol();
-            Object packet;
-            if (statePlay.equals(state)) {
-                if (!supportsPlayDialogs(protocol)) {
-                    return false;
-                }
-                packet = rawPlayShowPacket(protocol, dialog);
-            } else {
-                packet = buildShowPacket(player, dialog, state);
-            }
-            connectionWrite.invoke(connection, packet);
-            return true;
-        } catch (Throwable t) {
-            logger.warn("Failed to send dialog to {}: {}", player.getUsername(), t.toString());
-            return false;
-        }
+        return sendDialogPacket(player, "send dialog to", (state, protocol) -> statePlay.equals(state)
+                ? DialogPacketCodec.rawPlayShowPacket(protocol, dialog)
+                : buildShowPacket(player, dialog, state));
     }
 
     /** Closes whatever dialog the client is showing. */
     public boolean clear(Player player) {
+        return sendDialogPacket(player, "clear dialog for", (state, protocol) -> {
+            if (statePlay.equals(state)) {
+                return DialogPacketCodec.rawPacket(DialogPacketCodec.playClearDialogId(protocol), null);
+            }
+            return dialogClearInstance != null
+                    ? dialogClearInstance
+                    : DialogPacketCodec.rawPacket(DialogPacketCodec.clearDialogId(protocol), null);
+        });
+    }
+
+    /** Builds a dialog packet for the connection's current state (CONFIG or PLAY). */
+    @FunctionalInterface
+    private interface DialogPacketFactory {
+        Object create(Object state, int protocol) throws Throwable;
+    }
+
+    private boolean sendDialogPacket(Player player, String action, DialogPacketFactory factory) {
         try {
-            Object connection = getConnection.invoke(player);
-            if (connection == null || (boolean) connectionIsClosed.invoke(connection)) {
+            Object connection = openConnection(player);
+            if (connection == null) {
                 return false;
             }
             Object state = dialogState(connectionGetState.invoke(connection));
-            if (state == null) {
+            int protocol = player.getProtocolVersion().getProtocol();
+            if (state == null || (statePlay.equals(state) && !supportsPlayDialogs(protocol))) {
                 return false;
             }
-            int protocol = player.getProtocolVersion().getProtocol();
-            Object packet;
-            if (statePlay.equals(state)) {
-                if (!supportsPlayDialogs(protocol)) {
-                    return false;
-                }
-                packet = rawPacket(playClearDialogId(protocol), null);
-            } else {
-                packet = dialogClearInstance != null
-                        ? dialogClearInstance
-                        : rawPacket(clearDialogId(protocol), null);
-            }
-            connectionWrite.invoke(connection, packet);
+            connectionWrite.invoke(connection, factory.create(state, protocol));
             return true;
         } catch (Throwable t) {
-            logger.debug("Failed to clear dialog for {}: {}", player.getUsername(), t.toString());
+            logger.debug("Failed to {} {}: {}", action, player.getUsername(), t.toString());
             return false;
         }
     }
@@ -463,8 +426,7 @@ public final class VelocityDialogTransport {
             if (connection == null) {
                 return false;
             }
-            Channel channel = (Channel) connectionGetChannel.invoke(connection);
-            ChannelPipeline pipeline = channel.pipeline();
+            ChannelPipeline pipeline = pipelineOf(connection);
             if (pipeline.get(HANDLER_NAME) != null) {
                 return true;
             }
@@ -485,17 +447,36 @@ public final class VelocityDialogTransport {
     /** Removes the click handler installed by {@link #attachClickListener}. */
     public void detachClickListener(Player player) {
         try {
-            Object connection = getConnection.invoke(player);
-            if (connection == null) {
-                return;
-            }
-            Channel channel = (Channel) connectionGetChannel.invoke(connection);
-            ChannelPipeline pipeline = channel.pipeline();
-            if (pipeline.get(HANDLER_NAME) != null) {
-                pipeline.remove(HANDLER_NAME);
-            }
+            removeHandler(player, HANDLER_NAME);
         } catch (Throwable t) {
             logger.debug("Failed to detach dialog click listener for {}: {}", player.getUsername(), t.toString());
+        }
+    }
+
+    // ------------------------------------------------------------------ connection helpers
+
+    /** The player's Velocity connection, or {@code null} when absent or already closed. */
+    private Object openConnection(Player player) throws Throwable {
+        Object connection = getConnection.invoke(player);
+        if (connection == null || (boolean) connectionIsClosed.invoke(connection)) {
+            return null;
+        }
+        return connection;
+    }
+
+    private ChannelPipeline pipelineOf(Object connection) throws Throwable {
+        Channel channel = (Channel) connectionGetChannel.invoke(connection);
+        return channel.pipeline();
+    }
+
+    private void removeHandler(Player player, String handlerName) throws Throwable {
+        Object connection = getConnection.invoke(player);
+        if (connection == null) {
+            return;
+        }
+        ChannelPipeline pipeline = pipelineOf(connection);
+        if (pipeline.get(handlerName) != null) {
+            pipeline.remove(handlerName);
         }
     }
 
@@ -508,176 +489,7 @@ public final class VelocityDialogTransport {
             dialogShowNbtField.set(packet, dialog);
             return packet;
         }
-        return rawPacket(showDialogId(player.getProtocolVersion().getProtocol()), dialog);
-    }
-
-    // PLAY ids per protocol, taken from Mojang's packet reports (1.21.6=771 ... 26.3=777; 26.2 shares
-    // the 26.1 ids). Velocity does not register these packets in PLAY, so they are written raw.
-
-    /** Clientbound PLAY {@code show_dialog} id; body is {@code VarInt 0 (inline) + NBT}. */
-    static int playShowDialogId(int protocol) {
-        if (protocol >= PROTOCOL_26_3) {
-            return 0x8F;
-        }
-        if (protocol >= PROTOCOL_26_1) {
-            return 0x8C;
-        }
-        if (protocol >= PROTOCOL_1_21_9) {
-            return 0x8A;
-        }
-        return 0x85;
-    }
-
-    /** Clientbound PLAY {@code clear_dialog} id. */
-    static int playClearDialogId(int protocol) {
-        return playShowDialogId(protocol) - 1;
-    }
-
-    /** Serverbound PLAY {@code custom_click_action} id. */
-    static int playCustomClickId(int protocol) {
-        return protocol >= PROTOCOL_26_1 ? 0x44 : 0x41;
-    }
-
-    /** Serverbound PLAY {@code chat_session_update} (profile key) id. */
-    public static int playChatSessionId(int protocol) {
-        return protocol >= PROTOCOL_26_1 ? 0x0A : 0x09;
-    }
-
-    static ByteBuf rawPlayShowPacket(int protocol, BinaryTag nbt) throws IOException {
-        ByteBuf buf = Unpooled.buffer();
-        writeVarInt(buf, playShowDialogId(protocol));
-        writeVarInt(buf, 0); // inline dialog (not a registry id)
-        writeNbt(buf, nbt);
-        return buf;
-    }
-
-    /** Clientbound CONFIGURATION {@code show_dialog} id (the NBT follows directly, no holder). */
-    static int showDialogId(int protocol) {
-        return protocol >= PROTOCOL_26_3 ? 0x13 : 0x12;
-    }
-
-    /** Clientbound CONFIGURATION {@code clear_dialog} id. */
-    static int clearDialogId(int protocol) {
-        return protocol >= PROTOCOL_26_3 ? 0x12 : 0x11;
-    }
-
-    /** Builds a raw framed packet body: varint id + optional network NBT (nameless root). */
-    static ByteBuf rawPacket(int packetId, BinaryTag nbt) throws IOException {
-        ByteBuf buf = Unpooled.buffer();
-        writeVarInt(buf, packetId);
-        if (nbt != null) {
-            writeNbt(buf, nbt);
-        }
-        return buf;
-    }
-
-    /**
-     * Writes a network ("nameless") compound tag. Deliberately avoids invoking methods on
-     * {@code BinaryTagType}: it is an abstract class in Adventure 4.x (Velocity 3.x) but an
-     * interface in Adventure 5.x (Velocity 4.x), so such calls would throw
-     * {@link IncompatibleClassChangeError} on one of the two proxies. {@code BinaryTagIO}
-     * exposes the same operation through a stable interface.
-     */
-    static void writeNbt(ByteBuf buf, BinaryTag tag) throws IOException {
-        if (!(tag instanceof CompoundBinaryTag compound)) {
-            throw new IOException("Dialog payloads must be compound tags, got " + tag.getClass().getSimpleName());
-        }
-        try (DataOutputStream out = new DataOutputStream(new ByteBufOutputStream(buf))) {
-            BinaryTagIO.writer().writeNameless(compound, (java.io.DataOutput) out);
-        }
-    }
-
-    static void writeVarInt(ByteBuf buf, int value) {
-        int remaining = value;
-        while ((remaining & ~0x7F) != 0) {
-            buf.writeByte((remaining & 0x7F) | 0x80);
-            remaining >>>= 7;
-        }
-        buf.writeByte(remaining);
-    }
-
-    static int readVarInt(ByteBuf buf) {
-        int result = 0;
-        int shift = 0;
-        while (true) {
-            if (!buf.isReadable()) {
-                throw new IllegalArgumentException("VarInt truncated");
-            }
-            byte b = buf.readByte();
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                return result;
-            }
-            shift += 7;
-            if (shift > 35) {
-                throw new IllegalArgumentException("VarInt too big");
-            }
-        }
-    }
-
-    static String readString(ByteBuf buf, int maxLength) {
-        int length = readVarInt(buf);
-        if (length < 0 || length > maxLength * 4 || length > buf.readableBytes()) {
-            throw new IllegalArgumentException("Bad string length " + length);
-        }
-        String value = buf.toString(buf.readerIndex(), length, StandardCharsets.UTF_8);
-        buf.skipBytes(length);
-        return value;
-    }
-
-    /**
-     * Parses the body of a serverbound {@code custom_click_action}: identifier, then the
-     * VarInt-prefixed nameless NBT payload (TAG_End when the action carries no data).
-     *
-     * @return the click, or {@code null} when the identifier is not in the {@code veloauth} namespace
-     */
-    static DialogClick parseClick(ByteBuf body) throws IOException {
-        String id = readString(body, 32_767);
-        int colon = id.indexOf(':');
-        String namespace = colon >= 0 ? id.substring(0, colon) : "minecraft";
-        if (!DialogNbt.ACTION_NAMESPACE.equals(namespace.toLowerCase(Locale.ROOT))) {
-            return null;
-        }
-        String path = colon >= 0 ? id.substring(colon + 1) : id;
-        return new DialogClick(path, readClickPayload(body));
-    }
-
-    private static CompoundBinaryTag readClickPayload(ByteBuf body) throws IOException {
-        if (!body.isReadable()) {
-            return CompoundBinaryTag.empty();
-        }
-        // Wire format (1.21.6+): VarInt payload size, then a nameless NBT tag; TAG_End (0) = no payload.
-        int length = readVarInt(body);
-        if (length < 0 || length > MAX_CLICK_PAYLOAD || length > body.readableBytes()) {
-            throw new IllegalArgumentException("Bad click payload length " + length);
-        }
-        ByteBuf block = body.readSlice(length);
-        if (!block.isReadable()) {
-            return CompoundBinaryTag.empty();
-        }
-        BinaryTag tag = readNbt(block);
-        return tag instanceof CompoundBinaryTag compound ? compound : CompoundBinaryTag.empty();
-    }
-
-    /**
-     * Reads a network ("nameless") NBT tag. Only compound payloads are meaningful for dialog
-     * clicks (the client always sends a compound with one entry per input), everything else is
-     * skipped and reported as {@code null}.
-     */
-    static BinaryTag readNbt(ByteBuf buf) throws IOException {
-        byte typeId = buf.getByte(buf.readerIndex());
-        if (typeId == 0) {
-            buf.readByte();
-            return null;
-        }
-        if (typeId != NBT_TYPE_COMPOUND) {
-            // Non-compound payload: not something a dialog produces; ignore the remaining bytes.
-            buf.skipBytes(buf.readableBytes());
-            return null;
-        }
-        try (DataInputStream in = new DataInputStream(new ByteBufInputStream(buf))) {
-            return BinaryTagIO.reader(MAX_CLICK_PAYLOAD).readNameless((java.io.DataInput) in);
-        }
+        return DialogPacketCodec.rawPacket(DialogPacketCodec.showDialogId(player.getProtocolVersion().getProtocol()), dialog);
     }
 
     /** Netty handler placed right after Velocity's packet decoder. */
@@ -697,47 +509,44 @@ public final class VelocityDialogTransport {
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            DialogClick click = null;
             if (msg instanceof ByteBuf raw && !(msg instanceof ByteBufHolder)) {
-                if (rawListener != null) {
-                    try {
-                        rawListener.accept(raw.duplicate());
-                    } catch (RuntimeException e) {
-                        logger.debug("Raw packet listener failed: {}", e.toString());
-                    }
-                }
+                offerRaw(raw);
                 // Velocity decodes custom_click_action in CONFIG only; in PLAY it passes through raw.
-                DialogClick click = parsePlayClick(raw);
-                if (click != null) {
-                    ReferenceCountUtil.release(msg);
-                    try {
-                        listener.accept(click);
-                    } catch (RuntimeException e) {
-                        logger.warn("Dialog click handler failed", e);
-                    }
-                    return;
-                }
+                click = parsePlayClick(raw);
+            } else if (customClickClass.isInstance(msg) && msg instanceof ByteBufHolder holder) {
+                click = parseConfigClick(holder);
             }
-            if (customClickClass.isInstance(msg) && msg instanceof ByteBufHolder holder) {
-                DialogClick click = null;
-                boolean ours = false;
-                try {
-                    ByteBuf body = holder.content().duplicate();
-                    click = parseClick(body);
-                    ours = click != null;
-                } catch (IOException | RuntimeException e) {
-                    logger.debug("Ignoring malformed custom click action: {}", e.toString());
-                }
-                if (ours) {
-                    ReferenceCountUtil.release(msg);
-                    try {
-                        listener.accept(click);
-                    } catch (RuntimeException e) {
-                        logger.warn("Dialog click handler failed", e);
-                    }
-                    return;
-                }
+            if (click == null) {
+                ctx.fireChannelRead(msg);
+                return;
             }
-            ctx.fireChannelRead(msg);
+            ReferenceCountUtil.release(msg);
+            try {
+                listener.accept(click);
+            } catch (RuntimeException e) {
+                logger.warn("Dialog click handler failed", e);
+            }
+        }
+
+        private void offerRaw(ByteBuf raw) {
+            if (rawListener == null) {
+                return;
+            }
+            try {
+                rawListener.accept(raw.duplicate());
+            } catch (RuntimeException e) {
+                logger.debug("Raw packet listener failed: {}", e.toString());
+            }
+        }
+
+        private DialogClick parseConfigClick(ByteBufHolder holder) {
+            try {
+                return DialogPacketCodec.parseClick(holder.content().duplicate());
+            } catch (IOException | RuntimeException e) {
+                logger.debug("Ignoring malformed custom click action: {}", e.toString());
+                return null;
+            }
         }
 
         private DialogClick parsePlayClick(ByteBuf raw) {
@@ -746,10 +555,10 @@ public final class VelocityDialogTransport {
                     return null;
                 }
                 ByteBuf body = raw.duplicate();
-                if (readVarInt(body) != playCustomClickId(protocol)) {
+                if (DialogPacketCodec.readVarInt(body) != DialogPacketCodec.playCustomClickId(protocol)) {
                     return null;
                 }
-                return parseClick(body);
+                return DialogPacketCodec.parseClick(body);
             } catch (Throwable notOurs) {
                 return null;
             }

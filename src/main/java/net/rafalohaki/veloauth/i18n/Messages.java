@@ -426,14 +426,7 @@ public class Messages {
      */
     public Component componentForLocale(@javax.annotation.Nullable Locale clientLocale,
                                         String key, NamedTextColor fallbackColor, Object... args) {
-        String language = resolvePlayerLanguage(clientLocale);
-        if (language.equals(currentLanguage)) {
-            return component(key, fallbackColor, args);
-        }
-        String text = getForPlayerLanguage(language, resolveMessageKey(key), protectFormattingArguments(args));
-        Component component = restoreFormattingArguments(parseWithColors(text, fallbackColor));
-        recordCapture(resolveMessageKey(key), fallbackColor, args, component);
-        return component;
+        return componentForLanguage(resolvePlayerLanguage(clientLocale), key, fallbackColor, args);
     }
 
     /**

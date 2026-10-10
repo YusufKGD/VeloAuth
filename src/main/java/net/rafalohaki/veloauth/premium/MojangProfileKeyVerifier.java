@@ -50,10 +50,8 @@ public final class MojangProfileKeyVerifier {
      */
     public static boolean verify(@Nullable UUID profile, long expiresAt, @Nullable byte[] keyBytes,
                                  @Nullable byte[] signature, long nowMillis) {
-        if (YGGDRASIL_SESSION_KEY == null || profile == null || keyBytes == null || signature == null
-                || keyBytes.length == 0 || keyBytes.length > MAX_KEY_BYTES
-                || signature.length == 0 || signature.length > MAX_SIGNATURE_BYTES
-                || expiresAt <= nowMillis) {
+        if (YGGDRASIL_SESSION_KEY == null || profile == null || expiresAt <= nowMillis
+                || !withinLimit(keyBytes, MAX_KEY_BYTES) || !withinLimit(signature, MAX_SIGNATURE_BYTES)) {
             return false;
         }
         try {
@@ -64,13 +62,20 @@ public final class MojangProfileKeyVerifier {
             data.putLong(profile.getLeastSignificantBits());
             data.putLong(expiresAt);
             data.put(keyBytes);
-            Signature verifier = Signature.getInstance(ALGORITHM);
+            // SHA1withRSA is the algorithm Mojang's session server signs profile keys with; the
+            // vanilla client and server verify with the same algorithm. It cannot be upgraded
+            // on the receiving side, and it is only used to verify, never to sign.
+            Signature verifier = Signature.getInstance(ALGORITHM); // nosemgrep: java.lang.security.audit.crypto.weak-hash
             verifier.initVerify(YGGDRASIL_SESSION_KEY);
             verifier.update(data.array());
             return verifier.verify(signature);
         } catch (GeneralSecurityException | RuntimeException e) {
             return false;
         }
+    }
+
+    private static boolean withinLimit(@Nullable byte[] bytes, int max) {
+        return bytes != null && bytes.length > 0 && bytes.length <= max;
     }
 
     @Nullable

@@ -42,31 +42,37 @@ public record ProfileKeyPacket(long expiresAt, byte[] publicKey, byte[] signatur
         }
         ByteBuf buf = raw.duplicate();
         try {
-            int id = readVarInt(buf);
-            if (id < 0 || (expectedId >= 0 && id != expectedId)) {
-                return null; // packet id
-            }
-            if (buf.readableBytes() < UUID_BYTES + Long.BYTES + 2) {
-                return null;
-            }
-            buf.skipBytes(UUID_BYTES);
-            long expiresAt = buf.readLong();
-            int keyLength = readVarInt(buf);
-            if (keyLength <= 0 || keyLength > MAX_KEY || keyLength > buf.readableBytes()) {
-                return null;
-            }
-            byte[] key = new byte[keyLength];
-            buf.readBytes(key);
-            int signatureLength = readVarInt(buf);
-            if (signatureLength <= 0 || signatureLength > MAX_SIGNATURE || signatureLength != buf.readableBytes()) {
-                return null;
-            }
-            byte[] signature = new byte[signatureLength];
-            buf.readBytes(signature);
-            return new ProfileKeyPacket(expiresAt, key, signature);
+            return hasExpectedHeader(buf, expectedId) ? readBody(buf) : null;
         } catch (RuntimeException malformed) {
             return null;
         }
+    }
+
+    private static boolean hasExpectedHeader(ByteBuf buf, int expectedId) {
+        int id = readVarInt(buf);
+        boolean idOk = id >= 0 && (expectedId < 0 || id == expectedId);
+        return idOk && buf.readableBytes() >= UUID_BYTES + Long.BYTES + 2;
+    }
+
+    @Nullable
+    private static ProfileKeyPacket readBody(ByteBuf buf) {
+        buf.skipBytes(UUID_BYTES);
+        long expiresAt = buf.readLong();
+        byte[] key = readBlock(buf, MAX_KEY, false);
+        byte[] signature = key.length == 0 ? key : readBlock(buf, MAX_SIGNATURE, true);
+        return signature.length == 0 ? null : new ProfileKeyPacket(expiresAt, key, signature);
+    }
+
+    /** VarInt-prefixed byte block; empty when the length is implausible. */
+    private static byte[] readBlock(ByteBuf buf, int maxLength, boolean mustBeLast) {
+        int length = readVarInt(buf);
+        boolean sizeOk = mustBeLast ? length == buf.readableBytes() : length <= buf.readableBytes();
+        if (length <= 0 || length > maxLength || !sizeOk) {
+            return new byte[0];
+        }
+        byte[] block = new byte[length];
+        buf.readBytes(block);
+        return block;
     }
 
     /** Reads a VarInt; returns -1 when malformed. */

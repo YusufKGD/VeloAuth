@@ -41,7 +41,8 @@ class MojangProfileKeyVerifierTest {
         ByteBuffer payload = ByteBuffer.allocate(24 + playerKey.length);
         payload.putLong(PROFILE.getMostSignificantBits()).putLong(PROFILE.getLeastSignificantBits())
                 .putLong(expiry).put(playerKey);
-        Signature signer = Signature.getInstance("SHA1withRSA");
+        // Same algorithm Mojang uses for profile keys; this test forges a signature with the wrong key.
+        Signature signer = Signature.getInstance("SHA1withRSA"); // nosemgrep: java.lang.security.audit.crypto.weak-hash
         signer.initSign(forger.getPrivate());
         signer.update(payload.array());
         byte[] forged = signer.sign();

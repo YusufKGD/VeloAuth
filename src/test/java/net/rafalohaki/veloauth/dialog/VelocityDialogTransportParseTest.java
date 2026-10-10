@@ -22,11 +22,12 @@ import org.junit.jupiter.api.Test;
 class VelocityDialogTransportParseTest {
 
     private static void writeVarInt(ByteArrayOutputStream out, int value) {
-        while ((value & ~0x7F) != 0) {
-            out.write((value & 0x7F) | 0x80);
-            value >>>= 7;
+        int remaining = value;
+        while ((remaining & ~0x7F) != 0) {
+            out.write((remaining & 0x7F) | 0x80);
+            remaining >>>= 7;
         }
-        out.write(value);
+        out.write(remaining);
     }
 
     private static void writeString(ByteArrayOutputStream out, String value) {
@@ -55,7 +56,7 @@ class VelocityDialogTransportParseTest {
                 .putString("password", "secret123")
                 .putString("confirm", "secret123")
                 .build();
-        DialogClick click = VelocityDialogTransport.parseClick(body("veloauth:register", payload));
+        DialogClick click = DialogPacketCodec.parseClick(body("veloauth:register", payload));
         assertNotNull(click);
         assertEquals("register", click.action());
         assertEquals("secret123", click.text("password"));
@@ -64,7 +65,7 @@ class VelocityDialogTransportParseTest {
 
     @Test
     void parsesClickWithoutPayload() throws IOException {
-        DialogClick click = VelocityDialogTransport.parseClick(body("veloauth:exit", null));
+        DialogClick click = DialogPacketCodec.parseClick(body("veloauth:exit", null));
         assertNotNull(click);
         assertEquals("exit", click.action());
         assertTrue(click.payload().size() == 0);
@@ -73,6 +74,6 @@ class VelocityDialogTransportParseTest {
     @Test
     void ignoresForeignNamespace() throws IOException {
         CompoundBinaryTag payload = CompoundBinaryTag.builder().putString("x", "y").build();
-        assertNull(VelocityDialogTransport.parseClick(body("otherplugin:thing", payload)));
+        assertNull(DialogPacketCodec.parseClick(body("otherplugin:thing", payload)));
     }
 }

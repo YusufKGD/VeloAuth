@@ -13,11 +13,12 @@ import org.junit.jupiter.api.Test;
 class ProfileKeyPacketTest {
 
     private static void writeVarInt(ByteBuf buf, int value) {
-        while ((value & ~0x7F) != 0) {
-            buf.writeByte((value & 0x7F) | 0x80);
-            value >>>= 7;
+        int remaining = value;
+        while ((remaining & ~0x7F) != 0) {
+            buf.writeByte((remaining & 0x7F) | 0x80);
+            remaining >>>= 7;
         }
-        buf.writeByte(value);
+        buf.writeByte(remaining);
     }
 
     private static ByteBuf sessionPacket(int packetId, byte[] key, byte[] sig) {

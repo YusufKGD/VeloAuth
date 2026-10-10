@@ -154,21 +154,20 @@ public final class DialogNbt {
     }
 
     private static BinaryTag fromNumber(Number number) {
-        if (number instanceof Double || number instanceof Float) {
-            return DoubleBinaryTag.doubleBinaryTag(number.doubleValue());
-        }
         if (number instanceof Long) {
             return LongBinaryTag.longBinaryTag(number.longValue());
         }
-        String raw = number.toString();
-        if (raw.contains(".") || raw.contains("e") || raw.contains("E")) {
+        if (number instanceof Double || number instanceof Float || looksFractional(number.toString())) {
             return DoubleBinaryTag.doubleBinaryTag(number.doubleValue());
         }
         long value = number.longValue();
-        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
-            return LongBinaryTag.longBinaryTag(value);
-        }
-        return IntBinaryTag.intBinaryTag((int) value);
+        return value < Integer.MIN_VALUE || value > Integer.MAX_VALUE
+                ? LongBinaryTag.longBinaryTag(value)
+                : IntBinaryTag.intBinaryTag((int) value);
+    }
+
+    private static boolean looksFractional(String raw) {
+        return raw.contains(".") || raw.contains("e") || raw.contains("E");
     }
 
     private static BinaryTag fromObject(JsonObject object) {

@@ -13,6 +13,8 @@ import net.rafalohaki.veloauth.util.PlayerAddressUtils;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
+import javax.annotation.Nullable;
 
 /**
  * Entry point used by the dialog (GUI) authentication flow.
@@ -79,6 +81,11 @@ public final class DialogAuthBridge {
 
     /** Runs the /login pipeline with the given password. */
     public Result login(Player player, String password) {
+        return runCaptured(player, operation -> loginCommand.processLogin(player, password, operation));
+    }
+
+    /** Runs a chat-command pipeline as the player and classifies the messages it produced. */
+    private Result runCaptured(Player player, Consumer<ConnectionLifecycleRegistry.Operation> pipeline) {
         ConnectionLifecycleRegistry.Operation operation = ctx.captureConnectionOperation(player);
         if (operation == null) {
             return Result.failed(KEY_GENERIC);
@@ -86,7 +93,7 @@ public final class DialogAuthBridge {
         Messages.beginCapture();
         List<Messages.CapturedMessage> captured;
         try {
-            ctx.messages().runAsPlayer(player, () -> loginCommand.processLogin(player, password, operation));
+            ctx.messages().runAsPlayer(player, () -> pipeline.accept(operation));
         } finally {
             captured = Messages.endCapture();
         }
@@ -95,13 +102,26 @@ public final class DialogAuthBridge {
 
     /** Runs the /register pipeline (validation + persistence + post-auth flow). */
     public Result register(Player player, String password, String confirm) {
-        ConnectionLifecycleRegistry.Operation operation = ctx.captureConnectionOperation(player);
-        if (operation == null) {
-            return Result.failed(KEY_GENERIC);
-        }
         Settings.PasswordSettings passwordSettings = passwordSettings();
-        // Cheap pre-checks with re-localizable keys so the dialog can show them in the
-        // player's own language; the full validator below remains authoritative.
+        Result rejected = precheckPassword(password, confirm, passwordSettings);
+        if (rejected != null) {
+            return rejected;
+        }
+        return runCaptured(player, operation -> {
+            if (CommandHelper.requireValidPassword(player, password, passwordSettings, ctx.messages())
+                    && CommandHelper.requirePasswordsMatch(player, password, confirm, ctx.messages())) {
+                registerCommand.processRegistration(player, password, operation, passwordSettings,
+                        new DatabaseManager.RegistrationCommitPermit());
+            }
+        });
+    }
+
+    /**
+     * Cheap pre-checks with re-localizable keys so the dialog can show them in the player's own
+     * language; the full validator in the register pipeline remains authoritative.
+     */
+    @Nullable
+    private static Result precheckPassword(String password, String confirm, Settings.PasswordSettings passwordSettings) {
         if (password == null || password.isEmpty()) {
             return Result.failed("validation.password.empty");
         }
@@ -116,40 +136,13 @@ public final class DialogAuthBridge {
         if (!password.equals(confirm)) {
             return Result.failed("validation.password.mismatch");
         }
-        Messages.beginCapture();
-        List<Messages.CapturedMessage> captured;
-        try (AutoCloseable ignored = ctx.messages().playerScope(player)) {
-            if (!CommandHelper.requireValidPassword(player, password, passwordSettings, ctx.messages())
-                    || !CommandHelper.requirePasswordsMatch(player, password, confirm, ctx.messages())) {
-                return classify(player, Messages.endCapture());
-            }
-            var commitPermit = new DatabaseManager.RegistrationCommitPermit();
-            registerCommand.processRegistration(player, password, operation, passwordSettings, commitPermit);
-        } catch (RuntimeException e) {
-            throw e;
-        } catch (Exception scopeFailure) {
-            throw new IllegalStateException(scopeFailure);
-        } finally {
-            captured = Messages.endCapture();
-        }
-        return classify(player, captured);
+        return null;
     }
 
     /** Runs the /2fa verify pipeline for a pending post-password login. */
     public Result verifyTotp(Player player, String code) {
-        ConnectionLifecycleRegistry.Operation operation = ctx.captureConnectionOperation(player);
-        if (operation == null) {
-            return Result.failed(KEY_GENERIC);
-        }
-        Messages.beginCapture();
-        List<Messages.CapturedMessage> captured;
-        try {
-            ctx.messages().runAsPlayer(player, () -> twoFactorCommand.processVerify(
-                    player, new String[] {"verify", code == null ? "" : code.trim()}, operation));
-        } finally {
-            captured = Messages.endCapture();
-        }
-        return classify(player, captured);
+        String[] args = {"verify", code == null ? "" : code.trim()};
+        return runCaptured(player, operation -> twoFactorCommand.processVerify(player, args, operation));
     }
 
     /** Whether the player is fully authorized with a live session. */

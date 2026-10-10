@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Predicate;
+import javax.annotation.Nullable;
 
 /**
  * Complete table of Minecraft: Java Edition client locale codes (the value the client reports in
@@ -262,37 +263,41 @@ public final class MinecraftLocales {
             return fallback;
         }
         String code = minecraftCode.toLowerCase(Locale.ROOT).replace('-', '_');
-        // 1. exact code as a language file (e.g. zh_hk, pt_br, or an operator-added es_mx)
-        if (supported.test(code)) {
-            return code;
-        }
-        // 2. curated Minecraft -> VeloAuth table
-        String mapped = TABLE.get(code);
-        if (mapped != null && supported.test(mapped)) {
-            return mapped;
-        }
-        // 3. bare language part
         int underscore = code.indexOf('_');
         String lang = underscore > 0 ? code.substring(0, underscore) : code;
-        if (supported.test(lang)) {
-            return lang;
+        // In order: exact code as a language file (zh_hk, pt_br, an operator-added es_mx), the
+        // curated Minecraft -> VeloAuth table, the bare language part, the table entry for the
+        // bare language ("bar", "tok"), and finally a single language-family variant.
+        String resolved = firstSupported(supported, code, TABLE.get(code), lang, TABLE.get(lang));
+        if (resolved != null) {
+            return resolved;
         }
-        // 4. the table may also know the bare language (e.g. "bar", "tok")
-        String mappedLang = TABLE.get(lang);
-        if (mappedLang != null && supported.test(mappedLang)) {
-            return mappedLang;
+        String family = singleFamilyVariant(lang, supported);
+        return family != null ? family : fallback;
+    }
+
+    @Nullable
+    private static String firstSupported(Predicate<String> supported, String... candidates) {
+        for (String candidate : candidates) {
+            if (candidate != null && supported.test(candidate)) {
+                return candidate;
+            }
         }
-        // 5. single language-family variant (pt -> pt_br when only one pt_* file exists)
+        return null;
+    }
+
+    /** {@code pt -> pt_br} when exactly one {@code pt_*} file exists, otherwise {@code null}. */
+    @Nullable
+    private static String singleFamilyVariant(String lang, Predicate<String> supported) {
         String family = null;
         for (String candidate : BuiltInLanguages.codes()) {
             if (candidate.startsWith(lang + "_") && supported.test(candidate)) {
                 if (family != null) {
-                    family = null;
-                    break;
+                    return null;
                 }
                 family = candidate;
             }
         }
-        return family != null ? family : fallback;
+        return family;
     }
 }

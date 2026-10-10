@@ -45,14 +45,14 @@ public final class SettingsValidator {
 
     static void validateDialog(Settings settings) {
         Settings.DialogSettings dialog = settings.getDialogSettings();
-        if (dialog.getTimeoutSeconds() < 10 || dialog.getTimeoutSeconds() > 600) {
-            throw new IllegalArgumentException("dialog.timeout-seconds must be in range 10-600");
-        }
-        if (dialog.getLocaleWaitMillis() < 0 || dialog.getLocaleWaitMillis() > 10_000) {
-            throw new IllegalArgumentException("dialog.locale-wait-millis must be in range 0-10000");
-        }
-        if (dialog.getPremiumCheckSeconds() < 1 || dialog.getPremiumCheckSeconds() > 30) {
-            throw new IllegalArgumentException("dialog.premium-name-notice.check-seconds must be in range 1-30");
+        requireRange("dialog.timeout-seconds", dialog.getTimeoutSeconds(), 10, 600);
+        requireRange("dialog.locale-wait-millis", dialog.getLocaleWaitMillis(), 0, 10_000);
+        requireRange("dialog.premium-name-notice.check-seconds", dialog.getPremiumCheckSeconds(), 1, 30);
+    }
+
+    private static void requireRange(String option, long value, long min, long max) {
+        if (value < min || value > max) {
+            throw new IllegalArgumentException(option + " must be in range " + min + "-" + max);
         }
     }
 

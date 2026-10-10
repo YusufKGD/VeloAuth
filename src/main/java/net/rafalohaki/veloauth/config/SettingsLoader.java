@@ -13,11 +13,14 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @SuppressWarnings("java:S2068") // YAML config key names, not hardcoded credentials
 final class SettingsLoader {
 
     private static final String YAML_FIELD_ENABLED = "enabled";
+    private static final Set<String> DIALOG_FORMATS_CHAT = Set.of("chat_system", "chat", "command", "commands", "classic");
+    private static final Set<String> DIALOG_FORMATS_DIALOG = Set.of("dialog", "gui", "menu");
     private static final String CONFIG_KEY_DATABASE = "database";
     private static final String CONFIG_KEY_AUTH_SERVER = "auth-server";
     private static final String CONFIG_KEY_PICOLIMBO = "picolimbo";
@@ -139,16 +142,17 @@ final class SettingsLoader {
      */
     private static boolean resolveDialogEnabled(Map<String, Object> dialog, boolean fallback) {
         Object raw = dialog.get("format");
-        if (raw != null) {
-            String format = String.valueOf(raw).trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
-            return switch (format) {
-                case "chat_system", "chat", "command", "commands", "classic" -> false;
-                case "dialog", "gui", "menu" -> true;
-                default -> throw new IllegalArgumentException(
-                        "dialog.format must be 'dialog' or 'chat_system' (got '" + raw + "')");
-            };
+        if (raw == null) {
+            return YamlParserUtils.getBoolean(dialog, YAML_FIELD_ENABLED, fallback);
         }
-        return YamlParserUtils.getBoolean(dialog, YAML_FIELD_ENABLED, fallback);
+        String format = String.valueOf(raw).trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
+        if (DIALOG_FORMATS_CHAT.contains(format)) {
+            return false;
+        }
+        if (DIALOG_FORMATS_DIALOG.contains(format)) {
+            return true;
+        }
+        throw new IllegalArgumentException("dialog.format must be 'dialog' or 'chat_system' (got '" + raw + "')");
     }
 
     private static void loadTwoFactorSettings(Map<String, Object> config, Builder state) {
@@ -621,18 +625,7 @@ final class SettingsLoader {
         Settings.EmbeddedAuthServerSettings embeddedAuthServerSettings;
 
         Builder(Settings.Snapshot snapshot) {
-            Settings.DatabaseConfig database = snapshot.database();
-            databaseStorageType = database.storageType();
-            databaseHostname = database.hostname();
-            databasePort = database.port();
-            databaseName = database.databaseName();
-            databaseUser = database.user();
-            databasePassword = database.password();
-            databaseConnectionUrl = database.connectionUrl();
-            databaseConnectionParameters = database.connectionParameters();
-            databaseConnectionPoolSize = database.connectionPoolSize();
-            databaseMaxLifetimeMillis = database.maxLifetimeMillis();
-            postgreSQLSettings = database.postgreSql();
+            copyDatabase(snapshot.database());
 
             Settings.CacheConfig cache = snapshot.cache();
             cacheTtlMinutes = cache.ttlMinutes();
@@ -678,6 +671,20 @@ final class SettingsLoader {
             reportIncludeLogs = hot.reportIncludeLogs();
             language = hot.language();
             detectClientLanguage = hot.detectClientLanguage();
+        }
+
+        private void copyDatabase(Settings.DatabaseConfig database) {
+            databaseStorageType = database.storageType();
+            databaseHostname = database.hostname();
+            databasePort = database.port();
+            databaseName = database.databaseName();
+            databaseUser = database.user();
+            databasePassword = database.password();
+            databaseConnectionUrl = database.connectionUrl();
+            databaseConnectionParameters = database.connectionParameters();
+            databaseConnectionPoolSize = database.connectionPoolSize();
+            databaseMaxLifetimeMillis = database.maxLifetimeMillis();
+            postgreSQLSettings = database.postgreSql();
         }
 
         Settings.Snapshot build() {

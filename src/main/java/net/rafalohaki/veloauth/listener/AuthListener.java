@@ -129,6 +129,7 @@ public class AuthListener {
      */
     @Inject
     private final PremiumNameAttemptTracker premiumNameAttempts = new PremiumNameAttemptTracker();
+    private final PremiumOwnershipCheckHandler premiumOwnership;
     /** Delay before the form is re-opened after a typed command (lets VeloAuth answer first). */
     private static final long FORM_RESHOW_DELAY_MILLIS = 400L;
     /** Lets the "verified" dialog reach the client before the transfer/kick. */
@@ -154,6 +155,8 @@ public class AuthListener {
             "PreLoginHandler cannot be null - initialization failed");
         this.postLoginHandler = java.util.Objects.requireNonNull(postLoginHandler, 
             "PostLoginHandler cannot be null - initialization failed");
+        this.premiumOwnership = new PremiumOwnershipCheckHandler(plugin, settings, messages, authCache,
+                databaseManager, connectionManager, premiumNameAttempts);
         this.uuidVerificationHandler = new UuidVerificationHandler(databaseManager, authCache, logger,
                 plugin::getAuditLogService,
                 new ConflictModeService(databaseManager, settings.getConflictModeTtlHours()));
@@ -584,86 +587,13 @@ public class AuthListener {
             return;
         }
 
-        if (!playerExistsInDb && shouldRunPremiumOwnershipCheck(event, username, premiumUuid)) {
+        if (!playerExistsInDb && premiumOwnership.shouldRunCheck(event, username, premiumUuid)) {
             // Unknown client on a premium nick: admit it offline (no encryption request) and prove
             // ownership on the auth server with the client's Mojang profile key.
             event.setResult(PreLoginEvent.PreLoginComponentResult.forceOfflineMode());
             return;
         }
         event.setResult(PreLoginEvent.PreLoginComponentResult.forceOnlineMode());
-    }
-
-    /**
-     * Unregistered premium nickname: the client is admitted offline for the ownership check on the
-     * auth server, because a cracked client cannot survive an encryption request (it fails silently
-     * on its own side) and nothing but the Mojang profile key can tell the two apart before that
-     * request. A verified owner gets a premium record, so its later joins take Velocity's regular
-     * Mojang handshake and go straight to the backend.
-     */
-    private boolean shouldRunPremiumOwnershipCheck(PreLoginEvent event, String username, UUID premiumUuid) {
-        Settings.DialogSettings dialogSettings = settings.getDialogSettings();
-        DialogAuthService dialogAuth = plugin.getDialogAuthService();
-        if (dialogSettings == null || !dialogSettings.isPremiumNameNotice() || premiumUuid == null
-                || dialogAuth == null || !dialogAuth.isPremiumCheckAvailable()) {
-            return false;
-        }
-        InetAddress address = PlayerAddressUtils.getAddressFromPreLogin(event);
-        if (address == null) {
-            return false;
-        }
-        premiumNameAttempts.markCheck(address.getHostAddress(), username, premiumUuid);
-        return true;
-    }
-
-    /**
-     * Starts the ownership check for a connection marked in PreLogin. The player is routed to the
-     * auth server by the regular unauthenticated flow; the dialog service takes over there.
-     */
-    private void startPremiumOwnershipCheck(Player player, UUID premiumUuid, Operation operation) {
-        DialogAuthService dialogAuth = plugin.getDialogAuthService();
-        String playerName = player.getUsername();
-        String ip = PlayerAddressUtils.getPlayerIp(player);
-        if (dialogAuth == null || !dialogAuth.supportsDialogs(player)) {
-            String language = dialogAuth != null ? dialogAuth.languageFor(player) : messages.getCurrentLanguage();
-            logger.info(SECURITY_MARKER, "[PREMIUM CHECK] {} cannot receive dialogs - disconnecting with premium-name notice (language {})",
-                    playerName, language);
-            connectionLifecycleRegistry.runIfCurrent(operation, () -> player.disconnect(
-                    messages.componentForLanguage(language, "connection.premium_name.kick", NamedTextColor.RED, playerName)));
-            return;
-        }
-        logger.info(SECURITY_MARKER, "[PREMIUM CHECK] {} uses premium nick without a VeloAuth record - verifying ownership on the auth server",
-                playerName);
-        connectionLifecycleRegistry.runIfCurrent(operation, () ->
-                dialogAuth.beginPremiumCheck(player, premiumUuid, () -> admitVerifiedPremium(player, ip, premiumUuid)));
-    }
-
-    /**
-     * The client proved ownership with its Mojang profile key (a Mojang-signed certificate that
-     * names this exact profile UUID). That is cryptographic proof, so the player is admitted right
-     * here: authorized in the cache, given a premium record (so the next joins take Velocity's
-     * regular Mojang handshake and go straight to the backend) and moved on - no transfer packet,
-     * no reconnect, no second auth-server visit.
-     */
-    private void admitVerifiedPremium(Player player, String ip, UUID premiumUuid) {
-        String username = player.getUsername();
-        premiumNameAttempts.clear(ip, username);
-        PremiumAuthorizer.authorize(player, ip, authCache);
-
-        RegisteredPlayer record = new RegisteredPlayer(username, null, ip, player.getUniqueId().toString());
-        record.setPremiumUuid(premiumUuid.toString());
-        databaseManager.registerPlayerIfAbsent(record).whenComplete((result, throwable) -> {
-            if (throwable != null || result == null || result.isDatabaseError()) {
-                logger.warn(SECURITY_MARKER, "[PREMIUM CHECK] Could not store premium record for {}: {}", username,
-                        throwable != null ? throwable.toString() : result == null ? "no result" : result.getErrorMessage());
-            } else if (logger.isInfoEnabled()) {
-                logger.info(SECURITY_MARKER, "[PREMIUM CHECK] {} verified via Mojang profile key - premium record {}",
-                        username, Boolean.TRUE.equals(result.getValue()) ? "created" : "already present");
-            }
-        });
-
-        if (player.isActive()) {
-            connectionManager.autoTransferFromAuthServerToBackend(player);
-        }
     }
 
     /**
@@ -948,50 +878,47 @@ public class AuthListener {
         }
 
         try {
-            // 🔥 USE_OFFLINE: Check for conflict resolution messages - delegate to PostLoginHandler
-            // ASYNC: Run on virtual thread to avoid blocking Netty IO threads
+            // Conflict resolution messages run on a virtual thread (no Netty IO blocking)
             checkConflictMessageAsync(player, operation);
-
-            // Delegate to PostLoginHandler based on player mode
-            if (player.isOnlineMode()) {
-                premiumNameAttempts.clear(playerIp, playerName);
-                connectionLifecycleRegistry.runIfCurrent(operation,
-                        () -> postLoginHandler.handlePremiumPlayer(player, playerIp));
-                return null;
-            }
-
-            // 🏷️ PREMIUM OWNERSHIP CHECK: this offline connection is routed to the auth server
-            // where the client's Mojang profile key decides between the real owner and a cracked
-            // client. Never authenticated here.
-            UUID premiumCheckUuid = premiumNameAttempts.consumeCheck(playerIp, playerName);
-            if (premiumCheckUuid != null) {
-                startPremiumOwnershipCheck(player, premiumCheckUuid, operation);
-                return null;
-            }
-
-            // Handle offline player - delegate to PostLoginHandler
-            connectionLifecycleRegistry.runIfCurrent(operation,
-                    () -> postLoginHandler.handleOfflinePlayer(player, playerIp));
-
-            // 🪟 DIALOG LOGIN (1.21.6+ / 26.x): the session is only prepared here. The player
-            // takes VeloAuth's regular route to the auth server and the login / register form
-            // opens there (ServerConnectedEvent), in the same place as the premium-name notice.
-            DialogAuthService dialogAuth = plugin.getDialogAuthService();
-            if (dialogAuth != null && dialogAuth.shouldHandle(player)) {
-                connectionLifecycleRegistry.runIfCurrent(operation, () -> {
-                    logger.debug(AUTH_MARKER, "Preparing dialog authentication for {}", playerName);
-                    dialogAuth.begin(player);
-                });
-            }
-
+            routePostLogin(player, playerIp, operation);
         } catch (RuntimeException e) {
-            logger.error("Error handling PostLoginEvent for player: {}", event.getPlayer().getUsername(), e);
-
+            logger.error("Error handling PostLoginEvent for player: {}", playerName, e);
             connectionLifecycleRegistry.runIfCurrent(operation,
-                    () -> event.getPlayer().disconnect(messages.forPlayer(event.getPlayer(),
-                            "connection.error.generic", NamedTextColor.RED)));
+                    () -> player.disconnect(messages.forPlayer(player, "connection.error.generic", NamedTextColor.RED)));
         }
         return null;
+    }
+
+    /** Premium players are authorized directly; offline connections go through the regular route. */
+    private void routePostLogin(Player player, String playerIp, Operation operation) {
+        String playerName = player.getUsername();
+        if (player.isOnlineMode()) {
+            premiumNameAttempts.clear(playerIp, playerName);
+            connectionLifecycleRegistry.runIfCurrent(operation,
+                    () -> postLoginHandler.handlePremiumPlayer(player, playerIp));
+            return;
+        }
+
+        // Premium ownership check: this offline connection is routed to the auth server where the
+        // client's Mojang profile key decides between the real owner and a cracked client.
+        UUID premiumCheckUuid = premiumNameAttempts.consumeCheck(playerIp, playerName);
+        if (premiumCheckUuid != null) {
+            premiumOwnership.startCheck(player, premiumCheckUuid, operation);
+            return;
+        }
+
+        connectionLifecycleRegistry.runIfCurrent(operation,
+                () -> postLoginHandler.handleOfflinePlayer(player, playerIp));
+
+        // Dialog login (1.21.6+): the session is only prepared here. The player takes VeloAuth's
+        // regular route to the auth server and the form opens there (ServerConnectedEvent).
+        DialogAuthService dialogAuth = plugin.getDialogAuthService();
+        if (dialogAuth != null && dialogAuth.shouldHandle(player)) {
+            connectionLifecycleRegistry.runIfCurrent(operation, () -> {
+                logger.debug(AUTH_MARKER, "Preparing dialog authentication for {}", playerName);
+                dialogAuth.begin(player);
+            });
+        }
     }
 
     private void publishConnectionGeneration(

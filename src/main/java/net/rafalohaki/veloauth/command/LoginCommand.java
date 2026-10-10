@@ -13,6 +13,7 @@ import net.rafalohaki.veloauth.util.PlayerAddressUtils;
 import net.rafalohaki.veloauth.util.SecurityUtils;
 
 import java.net.InetAddress;
+import javax.annotation.Nullable;
 
 /**
  * Handles the /login command.
@@ -58,6 +59,36 @@ class LoginCommand implements SimpleCommand {
                 () -> processLogin(player, password, operation), ERROR_DATABASE_QUERY);
     }
 
+    /**
+     * Returns the stored password hash, or {@code null} after replying why no password check is
+     * possible: already logged in with a live session, not registered, or a premium (hash-less)
+     * account.
+     *
+     * <p>The short-circuit applies only when BOTH authorization and an active session are valid.
+     * An authorized player whose session expired (TTL timeout or IP/nickname eviction) falls
+     * through to the password check - they reached the auth server and must re-authenticate.
+     */
+    @Nullable
+    private String loginHashOrReply(Player player, AuthenticationContext authContext) {
+        String playerIp = PlayerAddressUtils.getPlayerIp(player);
+        if (ctx.authCache().isPlayerAuthorized(player.getUniqueId(), playerIp)
+                && ctx.authCache().hasActiveSession(player.getUniqueId(), authContext.username(), playerIp)) {
+            reply(player, authContext, "auth.login.already_logged_in", NamedTextColor.YELLOW);
+            return null;
+        }
+        String hash = authContext.registeredPlayer() == null ? null : authContext.registeredPlayer().getHash();
+        if (hash == null || hash.isBlank()) {
+            reply(player, authContext, "auth.login.not_registered", NamedTextColor.RED);
+            return null;
+        }
+        return hash;
+    }
+
+    private void reply(Player player, AuthenticationContext authContext, String key, NamedTextColor color) {
+        ctx.runIfConnectionCurrent(authContext.connectionOperation(),
+                () -> player.sendMessage(ctx.messages().forPlayer(player, key, color)));
+    }
+
     /** Full /login pipeline; package-private so the dialog (GUI) flow can reuse it verbatim. */
     void processLogin(
             Player player, String password,
@@ -77,31 +108,8 @@ class LoginCommand implements SimpleCommand {
                 return;
             }
 
-            // Short-circuit only when BOTH authorization and an active session are valid.
-            // If authorized but the session has expired (TTL timeout or IP/nickname eviction),
-            // fall through to the password check — the player has reached the auth server and
-            // must re-authenticate. This closes the pre-1.3.3 deadlock where /login replied
-            // "already logged in" while ServerPreConnectEvent blocked the backend transfer.
-            String playerIp = PlayerAddressUtils.getPlayerIp(player);
-            if (ctx.authCache().isPlayerAuthorized(player.getUniqueId(), playerIp)
-                    && ctx.authCache().hasActiveSession(player.getUniqueId(), authContext.username(), playerIp)) {
-                ctx.runIfConnectionCurrent(authContext.connectionOperation(),
-                        () -> player.sendMessage(ctx.messages().forPlayer(player,
-                                "auth.login.already_logged_in", NamedTextColor.YELLOW)));
-                return;
-            }
-
-            if (authContext.registeredPlayer() == null) {
-                ctx.runIfConnectionCurrent(authContext.connectionOperation(),
-                        () -> player.sendMessage(ctx.messages().forPlayer(player,
-                                "auth.login.not_registered", NamedTextColor.RED)));
-                return;
-            }
-            String hash = authContext.registeredPlayer().getHash();
-            if (hash == null || hash.isBlank()) {
-                ctx.runIfConnectionCurrent(authContext.connectionOperation(),
-                        () -> player.sendMessage(ctx.messages().forPlayer(player,
-                                "auth.login.not_registered", NamedTextColor.RED)));
+            String hash = loginHashOrReply(player, authContext);
+            if (hash == null) {
                 return;
             }
 
